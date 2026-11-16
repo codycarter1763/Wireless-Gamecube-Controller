@@ -1,6 +1,6 @@
 #pragma once
 #include <stdio.h>
-#include "GC_Protocol.h"
+#include "gc_protocol.h"
 
 /* Format a payload like:  S Y X B A | L R Z ^ v > < | joy 128 128 | c 128 128 | L  20 R  18 */
 static inline void gc_format_payload(const GC_Payload *p, char *buf, size_t len)
