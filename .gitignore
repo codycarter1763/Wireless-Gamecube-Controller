@@ -1,0 +1,90 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux directory metadata
+.directory
+
+# Temporary files
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Log files
+*.log
+
+# Build directories (default + per-board)
+build/
+build_ctrl/
+build_rx/
+
+# Object files and binaries
+*.o
+*.a
+*.out
+# Host-side utilities compiled on Windows
+*.exe
+
+# ESP-IDF build outputs
+*.bin
+*.elf
+*.map
+# Generated in the build directory
+flasher_args.json
+
+# Generated sdkconfig files (machine/board-specific, contain peer MACs).
+# The *.defaults files are the source of truth and ARE committed.
+sdkconfig
+sdkconfig.old
+sdkconfig.controller
+sdkconfig.receiver
+sdkconfig.*.old
+!sdkconfig*.defaults
+
+# ESP-IDF component manager
+managed_components/
+/components/.idf/
+**/components/.idf/
+.espressif/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# Python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+dist/
+venv/
+.venv/
+env/
+
+# Language servers
+.clangd/
+.ccls-cache/
+compile_commands.json
+
+# Editor settings (ESP-IDF extension writes local paths/COM ports here)
+.vscode/
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# User-specific IDE files
+*.user
+# General workspace files
+*.workspace
+# Visual Studio
+*.suo
+*.sln.docstates

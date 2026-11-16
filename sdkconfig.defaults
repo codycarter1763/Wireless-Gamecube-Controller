@@ -1,0 +1,10 @@
+# 1 ms tick so the 2 ms poll period is exact
+CONFIG_FREERTOS_HZ=1000
+# Bit timing is cycle-counted; run at full speed
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# Core 1 is dedicated to Joybus and never idles on the receiver
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+# Keep Wi-Fi off core 1
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+# Needed for ESP-NOW radio power save while not connected to an AP
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=y

@@ -1,0 +1,85 @@
+menu "GC Wireless Controller"
+
+    choice GC_ROLE
+        prompt "Board role"
+        default GC_ROLE_CONTROLLER
+        config GC_ROLE_CONTROLLER
+            bool "Controller (reads the real GameCube pad)"
+        config GC_ROLE_RECEIVER
+            bool "Receiver (plugs into the console)"
+    endchoice
+
+    config GC_DATA_GPIO
+        int "Joybus data GPIO (0-31, not a strapping pin)"
+        range 0 31
+        default 4
+
+    config GC_PEER_MAC
+        string "Other board's MAC (aa:bb:cc:dd:ee:ff)"
+        default "00:00:00:00:00:00"
+        help
+            Printed by the other board at boot. Leave as zeros to test
+            a board on its own without the wireless link.
+
+    menu "Controller: send-on-change"
+        depends on GC_ROLE_CONTROLLER
+
+        config GC_KEEPALIVE_MS
+            int "Keepalive interval (ms)"
+            range 5 33
+            default 25
+            help
+                Send the current state at least this often, even when
+                nothing changed. Must stay well under the receiver's
+                100 ms stale timeout.
+
+        config GC_ANALOG_DEADBAND
+            int "Analog deadband (counts)"
+            range 0 10
+            default 2
+            help
+                A stick or trigger must move more than this from the last
+                value sent to count as a change. Filters out sensor noise.
+
+        config GC_ANALOG_MIN_INTERVAL_MS
+            int "Minimum interval between analog-only updates (ms)"
+            range 1 10
+            default 2
+            help
+                Caps the packet rate while a stick moves continuously.
+                Button changes ignore this cap and are sent immediately.
+    endmenu
+
+    menu "Controller: radio power save"
+        depends on GC_ROLE_CONTROLLER
+
+        config GC_POWER_SAVE
+            bool "Let the radio sleep between wake windows"
+            default y
+            help
+                The controller board mostly transmits, and transmitting
+                wakes the radio by itself. Listening (for rumble) only
+                happens inside wake windows, which saves most of the
+                radio's receive current. Rumble can then take up to one
+                wake interval to arrive. The receiver always stays awake.
+
+        config GC_PS_WAKE_INTERVAL_MS
+            int "Wake interval (ms)"
+            depends on GC_POWER_SAVE
+            range 10 1000
+            default 100
+            help
+                Espressif recommends multiples of 100 ms. Rumble can take
+                up to (interval - window) to reach the controller.
+
+        config GC_PS_WAKE_WINDOW_MS
+            int "Wake window per interval (ms)"
+            depends on GC_POWER_SAVE
+            range 1 1000
+            default 25
+            help
+                Must be smaller than the wake interval. The radio listens
+                for window/interval of the time (25% with the defaults).
+    endmenu
+
+endmenu
