@@ -1,0 +1,37 @@
+name: Build firmware
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [controller, receiver]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.role }}
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.1   # match your local ESP-IDF version
+          target: esp32s3
+          command: >
+            idf.py -B build_${{ matrix.role }}
+            -D SDKCONFIG=sdkconfig.${{ matrix.role }}
+            -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.${{ matrix.role }}.defaults"
+            build
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.role }}
+          path: |
+            build_${{ matrix.role }}/*.bin
+            build_${{ matrix.role }}/bootloader/bootloader.bin
+            build_${{ matrix.role }}/partition_table/partition-table.bin
+            build_${{ matrix.role }}/flasher_args.json
