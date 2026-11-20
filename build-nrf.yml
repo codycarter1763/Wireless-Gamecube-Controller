@@ -1,0 +1,86 @@
+name: Build nRF52840 firmware
+
+on:
+  push:
+    paths:
+      - "nrf_gc_wireless/**"
+      - ".github/workflows/build-nrf.yml"
+  pull_request:
+    paths:
+      - "nrf_gc_wireless/**"
+      - ".github/workflows/build-nrf.yml"
+  workflow_dispatch:
+
+env:
+  NCS_VERSION: v3.4.2          # match your local nRF Connect SDK
+  NCS_DIR: ${{ github.workspace }}/../ncs
+  ZEPHYR_TOOLCHAIN_VARIANT: gnuarmemb
+  GNUARMEMB_TOOLCHAIN_PATH: /usr
+  BOARD: promicro_nrf52840/nrf52840/uf2
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: ptx
+            name: controller
+          - role: prx
+            name: receiver
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            device-tree-compiler ninja-build
+          pip install west
+
+      # The SDK checkout (~1.8 GB) is cached per NCS version.
+      - name: Cache nRF Connect SDK
+        id: ncs-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NCS_DIR }}
+          key: ncs-${{ env.NCS_VERSION }}-min-v1
+
+      - name: Fetch nRF Connect SDK
+        if: steps.ncs-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$NCS_DIR" && cd "$NCS_DIR"
+          west init -m https://github.com/nrfconnect/sdk-nrf --mr "$NCS_VERSION"
+          # Only the modules this project needs (ESB, nrfx, Zephyr, libc).
+          west config manifest.project-filter -- \
+            "-.*,+zephyr,+nrfxlib,+hal_nordic,+cmsis_6,+cmsis,+segger,+mbedtls,+oberon-psa-crypto,+mcuboot,+tinycrypt,+picolibc,+zcbor,+trusted-firmware-m,+psa-arch-tests"
+          west update --narrow -o=--depth=1 zephyr
+          west update --narrow -o=--depth=1
+
+      - name: Install Python requirements
+        run: pip install -r "$NCS_DIR/zephyr/scripts/requirements-base.txt"
+
+      - name: Build ${{ matrix.name }} (${{ matrix.role }})
+        run: |
+          cd "$NCS_DIR"
+          west build -p -b "$BOARD" --no-sysbuild \
+            -d "$GITHUB_WORKSPACE/build_${{ matrix.role }}" \
+            "$GITHUB_WORKSPACE/nrf_gc_wireless" \
+            -- -DEXTRA_CONF_FILE=${{ matrix.role }}.conf
+          cp "$GITHUB_WORKSPACE/build_${{ matrix.role }}/zephyr/zephyr.uf2" \
+             "$GITHUB_WORKSPACE/gc_${{ matrix.name }}_${{ matrix.role }}.uf2"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.name }}
+          path: |
+            gc_${{ matrix.name }}_${{ matrix.role }}.uf2
+            build_${{ matrix.role }}/zephyr/zephyr.hex
+            build_${{ matrix.role }}/zephyr/zephyr.elf
