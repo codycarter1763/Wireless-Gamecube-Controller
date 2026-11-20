@@ -2,17 +2,12 @@ name: Build nRF52840 firmware
 
 on:
   push:
-    paths:
-      - "nrf_gc_wireless/**"
-      - ".github/workflows/build-nrf.yml"
   pull_request:
-    paths:
-      - "nrf_gc_wireless/**"
-      - ".github/workflows/build-nrf.yml"
   workflow_dispatch:
 
 env:
   NCS_VERSION: v3.4.2          # match your local nRF Connect SDK
+  APP_DIR: .                   # project folder, relative to the repo root
   NCS_DIR: ${{ github.workspace }}/../ncs
   ZEPHYR_TOOLCHAIN_VARIANT: gnuarmemb
   GNUARMEMB_TOOLCHAIN_PATH: /usr
@@ -71,7 +66,7 @@ jobs:
           cd "$NCS_DIR"
           west build -p -b "$BOARD" --no-sysbuild \
             -d "$GITHUB_WORKSPACE/build_${{ matrix.role }}" \
-            "$GITHUB_WORKSPACE/nrf_gc_wireless" \
+            "$GITHUB_WORKSPACE/$APP_DIR" \
             -- -DEXTRA_CONF_FILE=${{ matrix.role }}.conf
           cp "$GITHUB_WORKSPACE/build_${{ matrix.role }}/zephyr/zephyr.uf2" \
              "$GITHUB_WORKSPACE/gc_${{ matrix.name }}_${{ matrix.role }}.uf2"
