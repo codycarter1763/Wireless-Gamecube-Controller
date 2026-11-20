@@ -1,0 +1,94 @@
+# Bigger stacks than Zephyr's defaults: the stats printout (snprintf +
+# several long printk calls) overflowed the 1 KB main stack, which trips the
+# stack guard and halts the CPU. These must come before Kconfig.zephyr.
+config MAIN_STACK_SIZE
+	default 4096
+
+config SYSTEM_WORKQUEUE_STACK_SIZE
+	default 2048
+
+source "Kconfig.zephyr"
+
+menu "Wireless GameCube controller"
+
+# Pull in everything the app needs from Kconfig itself, so the build works
+# even if prj.conf is not picked up.
+config APP_ESB_LINK
+	bool
+	default y
+	select GPIO
+	select CLOCK_CONTROL
+	select ESB
+	select ESB_CLOCK_INIT
+
+choice APP_ROLE
+	prompt "Board role"
+	default APP_ROLE_PTX
+
+config APP_ROLE_PTX
+	bool "PTX - controller board (reads the real pad, sends inputs)"
+
+config APP_ROLE_PRX
+	bool "PRX - receiver board (plugs into the console)"
+
+endchoice
+
+config GC_DATA_PIN
+	int "Joybus data pin (P0.x)"
+	default 20
+	range 0 31
+	help
+	  GC data line (pin 2 on the plug), on both boards.
+	  Controller board: needs an external 1k pull-up to 3.3V.
+	  Receiver board: no pull-up; the console provides it.
+	  Default P0.20 = pin D3 on Pro Micro nRF52840 boards.
+	  Port 0 only. Avoid P0.09/P0.10 (NFC pins).
+
+config GC_RX_NO_SLEEP
+	bool "Receiver: never let the CPU sleep"
+	default y
+	depends on APP_ROLE_PRX
+	help
+	  Runs a lowest-priority busy loop so the CPU never enters WFI idle.
+	  Waking from idle delays the Joybus command ISR by several us, which
+	  is enough to miss the first console bits. Costs a few mA, which
+	  doesn't matter on the USB/console-powered receiver.
+
+config APP_POLL_INTERVAL_US
+	int "Pad poll + send interval (us)"
+	default 1000
+	depends on APP_ROLE_PTX
+	help
+	  How often the controller board polls the pad and sends the result.
+	  One poll + send takes about 650 us, so keep this at 1000 or above.
+
+config APP_RF_CHANNEL
+	int "ESB RF channel (2400 + n MHz)"
+	default 76
+	range 0 100
+	help
+	  76 = 2476 MHz: above Wi-Fi channel 11 and below BLE advertising
+	  channel 39 (2480 MHz). Must match on both boards.
+
+config APP_RETRANSMIT_DELAY_US
+	int "ESB retransmit delay (us)"
+	default 500
+	range 435 4000
+	help
+	  Time between retries when no ACK arrives. ESB rejects anything below
+	  435 us (esb_init() returns -EINVAL). Must match on both sides.
+
+config APP_RETRANSMIT_COUNT
+	int "ESB retransmit count"
+	default 3
+
+config APP_DEBUG_PIN
+	int "Debug GPIO (P0.x) for scope / logic analyzer"
+	default 17
+	range 0 31
+	help
+	  PTX: high from esb_write_payload() until TX success/fail.
+	  PRX: short pulse each time a packet is received.
+	  Default P0.17 (pin D2 on Pro Micro nRF52840 boards).
+
+endmenu
