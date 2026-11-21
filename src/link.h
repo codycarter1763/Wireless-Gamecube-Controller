@@ -16,6 +16,7 @@ int radio_init(bool prx);
 
 /* main.c helpers */
 void led_toggle(void);
+void led_set(bool on);
 void dbg_pin_set(bool on);
 uint32_t us_now(void);      /* thread context */
 uint32_t us_now_isr(void);  /* ESB event (ISR) context */

@@ -1,20 +1,44 @@
 /*
  * PTX = controller board: holds the real GameCube controller.
  *
- * Loop, every CONFIG_APP_POLL_INTERVAL_US:
- *   1. Poll the pad over Joybus (interrupts locked, ~370 us), with the
+ * Each poll tick:
+ *   1. Poll the pad over Joybus (interrupts masked, ~370 us), with the
  *      rumble bit taken from the latest ACK payload.
- *   2. Send the result to the receiver as a GC_TxPacket over ESB and wait
- *      for the ACK (~270 us). The ACK carries GC_RxPacket (rumble) back.
+ *   2. If the input changed (or the keepalive is due), send it to the
+ *      receiver as a GC_TxPacket over ESB and wait for the ACK, which
+ *      carries GC_RxPacket (rumble) back.
  * Steps 1 and 2 never overlap, so Joybus timing and the radio don't fight.
+ *
+ * Power states (all timed from the last real activity: a button change or a
+ * stick/trigger movement of at least CONFIG_APP_ACTIVITY_THRESH):
+ *   ACTIVE  poll every CONFIG_APP_POLL_INTERVAL_US, HF crystal kept on so a
+ *           send never waits for it.
+ *   DOZE    after CONFIG_APP_DOZE_S: poll every CONFIG_APP_DOZE_POLL_MS, HF
+ *           crystal on only while sending, status LED off. Any activity
+ *           returns to ACTIVE immediately.
+ *   OFF     after CONFIG_APP_SLEEP_MIN: pad power (VCC) cut, nRF System OFF.
+ *           A reset (or CONFIG_GC_WAKE_PIN) boots it again.
+ * A button held down without moving is not "activity", but it is still
+ * sent every keepalive, so the console never sees it released.
+ *
+ * Link loss: after CONFIG_APP_LINK_LOSS_FAILS failed sends in a row (no ACK
+ * after all retries), the controller stops sending on input changes and
+ * just probes every CONFIG_APP_LINK_PROBE_MS with the HF crystal off in
+ * between. The first acknowledged probe restores the link (and resends the
+ * origin). No receiver for CONFIG_APP_LINK_LOST_SLEEP_MIN -> power off.
  *
  * The origin (neutral stick/trigger values) is sent at startup and then
  * every 500 ms, so a receiver that powers up late still gets it.
  * If the pad stops answering, we go back to detecting it.
  */
 #include <esb.h>
+#include <stdlib.h>
 #include <string.h>
 #include <zephyr/kernel.h>
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/clock_control/nrf_clock_control.h>
+#include <zephyr/sys/poweroff.h>
+#include <hal/nrf_gpio.h>
 #include "link.h"
 #include "gc_protocol.h"
 #include "gc_debug.h"
@@ -23,6 +47,12 @@
 #define ORIGIN_RESEND_MS    500
 #define RUMBLE_TIMEOUT_MS   500   /* no ACK payload for this long -> rumble off */
 #define PAD_LOST_POLLS      100   /* consecutive bad polls -> re-detect pad */
+#define LED_PERIOD_MS       2000  /* status pulse while connected */
+#define LED_PULSE_MS        20
+#define LED_SEARCH_PERIOD_MS 1000 /* blink while searching for the receiver */
+#define LED_SEARCH_PULSE_MS 50
+
+enum pwr_state { PWR_ACTIVE, PWR_DOZE };
 
 struct ptx_stats {
 	/* Joybus */
@@ -37,11 +67,13 @@ struct ptx_stats {
 	uint32_t rtt_min;
 	uint32_t rtt_max;
 	uint64_t rtt_sum;
+	uint32_t link_lost;  /* times the link was declared lost */
 };
 
 static struct ptx_stats stats;
 static volatile uint32_t t_start;
 static volatile bool last_failed;
+static volatile bool last_ok;
 
 /* Rumble from the receiver, via ACK payloads. */
 static volatile uint8_t s_rumble;
@@ -64,6 +96,59 @@ static void stats_reset(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Pad power (VCC switch on Pro Micro nRF52840 / nice!nano boards)      */
+/* ------------------------------------------------------------------ */
+
+static void vcc_set(bool on)
+{
+#if CONFIG_GC_VCC_CTRL_PIN >= 0
+	const uint32_t pin = NRF_GPIO_PIN_MAP(0, CONFIG_GC_VCC_CTRL_PIN);
+	bool level = IS_ENABLED(CONFIG_GC_VCC_ON_HIGH) ? on : !on;
+
+	nrf_gpio_pin_write(pin, level);
+	nrf_gpio_cfg_output(pin);
+#else
+	ARG_UNUSED(on);
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* HF crystal: the radio needs it; it costs a few hundred uA while on   */
+/* ------------------------------------------------------------------ */
+
+static struct onoff_manager *s_hf_mgr;
+static struct onoff_client s_hf_cli;
+static bool s_hf_on;
+
+static void hfclk_on(void)
+{
+	int res;
+
+	if (s_hf_on) {
+		return;
+	}
+	if (!s_hf_mgr) {
+		s_hf_mgr = z_nrf_clock_control_get_onoff(CLOCK_CONTROL_NRF_SUBSYS_HF);
+	}
+	sys_notify_init_spinwait(&s_hf_cli.notify);
+	if (onoff_request(s_hf_mgr, &s_hf_cli) < 0) {
+		return;
+	}
+	/* Crystal start-up, typically a few hundred us. */
+	while (sys_notify_fetch_result(&s_hf_cli.notify, &res) == -EAGAIN) {
+	}
+	s_hf_on = true;
+}
+
+static void hfclk_off(void)
+{
+	if (s_hf_on) {
+		onoff_release(s_hf_mgr);
+		s_hf_on = false;
+	}
+}
+
+/* ------------------------------------------------------------------ */
 /* Radio                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -83,9 +168,7 @@ void app_esb_handler(const struct esb_evt *event)
 		stats.rtt_min = MIN(stats.rtt_min, rtt);
 		stats.rtt_max = MAX(stats.rtt_max, rtt);
 		last_failed = false;
-		if ((stats.ok % 100) == 0) {
-			led_toggle(); /* ~5 Hz blink = pad + radio both working */
-		}
+		last_ok = true;
 		k_sem_give(&tx_done);
 		break;
 	}
@@ -118,14 +201,18 @@ static uint8_t current_rumble(void)
 	return (k_uptime_get() - s_rumble_ms < RUMBLE_TIMEOUT_MS) ? s_rumble : 0;
 }
 
-/* Send one packet and wait for the ACK (or failure). */
-static void radio_send(const GC_TxPacket *pkt)
+/* Send one packet and wait for the ACK (or failure). Switches the HF crystal
+ * on if needed; while dozing or searching, the caller turns it off again.
+ * Returns true if the receiver acknowledged it. */
+static bool radio_send(const GC_TxPacket *pkt)
 {
 	struct esb_payload tx = {
 		.pipe = 0,
 		.noack = false,
 		.length = sizeof(*pkt),
 	};
+
+	hfclk_on();
 
 	if (last_failed) {
 		/* A failed packet stays in the TX FIFO; drop it, we only ever
@@ -136,6 +223,7 @@ static void radio_send(const GC_TxPacket *pkt)
 
 	memcpy(tx.data, pkt, sizeof(*pkt));
 
+	last_ok = false;
 	dbg_pin_set(true);
 	t_start = us_now();
 	int err = esb_write_payload(&tx);
@@ -143,30 +231,65 @@ static void radio_send(const GC_TxPacket *pkt)
 	if (err) {
 		dbg_pin_set(false);
 		esb_flush_tx();
-		return;
+		return false;
 	}
 	stats.sent++;
 	if (k_sem_take(&tx_done, K_MSEC(10)) != 0) {
 		stats.timeouts++;
 		esb_flush_tx();
+		return false;
 	}
+	return last_ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* Input change / activity detection                                   */
+/* ------------------------------------------------------------------ */
+
+/* Any analog value (sticks, triggers) differs by at least `thresh`. */
+static bool analog_moved(const GC_Payload *a, const GC_Payload *b, int thresh)
+{
+	const uint8_t *pa = &a->joy_X_val;
+	const uint8_t *pb = &b->joy_X_val;
+
+	for (int i = 0; i < 6; i++) {
+		if (abs((int)pa[i] - (int)pb[i]) >= thresh) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool buttons_changed(const GC_Payload *a, const GC_Payload *b)
+{
+	return ((a->byte0 ^ b->byte0) & (START_BTN | Y_BTN | X_BTN | B_BTN | A_BTN)) ||
+	       ((a->byte1 ^ b->byte1) & (L_BTN | R_BTN | Z_BTN | D_UP_BTN | D_DOWN_BTN |
+					  D_RIGHT_BTN | D_LEFT_BTN));
 }
 
 /* ------------------------------------------------------------------ */
 /* Pad                                                                 */
 /* ------------------------------------------------------------------ */
 
-/* Block until a pad answers, then read its origin. */
+static void power_off(const char *why);
+
+/* Block until a pad answers, then read its origin. With no pad for the
+ * whole sleep timeout, power off instead of retrying forever. */
 static void detect_pad(GC_Origin *origin)
 {
 	uint8_t id[3];
 	int tries = 0;
 	char line[96];
+	int64_t start = k_uptime_get();
 
 	while (joybus_host_read_id(id) != 0) {
 		if (tries++ % 20 == 0) {
 			printk("No controller detected on P0.%02d, retrying...\n",
 			       CONFIG_GC_DATA_PIN);
+		}
+		if (CONFIG_APP_SLEEP_MIN > 0 &&
+		    k_uptime_get() - start >= (int64_t)CONFIG_APP_SLEEP_MIN * 60 * 1000) {
+			power_off("No controller found");
 		}
 		k_msleep(100);
 	}
@@ -182,7 +305,31 @@ static void detect_pad(GC_Origin *origin)
 	printk("Origin: %s\n", line);
 }
 
-static void print_stats(const GC_Payload *pad)
+/* Cut pad power and put the nRF in System OFF. Does not return: the next
+ * thing that happens is a fresh boot from reset (or the wake pin). */
+static void power_off(const char *why)
+{
+	printk("%s: powering off. Press reset to wake.\n", why);
+	k_msleep(20);   /* let the message out, if a console is attached */
+
+	k_timer_stop(&poll_timer);
+	esb_disable();
+	hfclk_off();
+	led_set(false);
+
+	/* Release the Joybus pin before cutting VCC, so the pad isn't
+	 * back-powered through the pin's pull-up. */
+	nrf_gpio_cfg_default(NRF_GPIO_PIN_MAP(0, CONFIG_GC_DATA_PIN));
+	vcc_set(false);   /* GPIO state is kept through System OFF */
+
+#if CONFIG_GC_WAKE_PIN >= 0
+	nrf_gpio_cfg_sense_input(NRF_GPIO_PIN_MAP(0, CONFIG_GC_WAKE_PIN),
+				 NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
+#endif
+	sys_poweroff();
+}
+
+static void print_stats(const GC_Payload *pad, enum pwr_state st, bool link_up)
 {
 	struct ptx_stats s;
 	char line[96];
@@ -195,11 +342,21 @@ static void print_stats(const GC_Payload *pad)
 	uint32_t avg = s.ok ? (uint32_t)(s.rtt_sum / s.ok) : 0;
 
 	gc_format_payload(pad, line, sizeof(line));
-	printk("%s | rumble %u\n", line, current_rumble());
+	printk("%s | rumble %u | %s | %s\n", line, current_rumble(),
+	       st == PWR_ACTIVE ? "active" : "doze",
+	       link_up ? "linked" : "SEARCHING for receiver");
 	printk("  polls ok %u bad %u | radio sent %u ok %u fail %u timeout %u retries %u"
-	       " | RTT us min %u avg %u max %u\n",
+	       " | RTT us min %u avg %u max %u | link lost %u\n",
 	       s.polls_ok, s.polls_bad, s.sent, s.ok, s.failed, s.timeouts, s.retries,
-	       s.ok ? s.rtt_min : 0, avg, s.rtt_max);
+	       s.ok ? s.rtt_min : 0, avg, s.rtt_max, s.link_lost);
+}
+
+static void set_poll_rate(enum pwr_state st)
+{
+	k_timeout_t period = (st == PWR_ACTIVE) ? K_USEC(CONFIG_APP_POLL_INTERVAL_US)
+						: K_MSEC(CONFIG_APP_DOZE_POLL_MS);
+
+	k_timer_start(&poll_timer, period, period);
 }
 
 /* ------------------------------------------------------------------ */
@@ -211,10 +368,13 @@ void role_run(void)
 	GC_TxPacket pkt;
 	GC_Origin origin;
 	GC_Payload pad = {0};
+	GC_Payload last_sent = {0};
+	GC_Payload act_ref = {0};
 	uint8_t seq = 0;
-	int bad_streak = 0;
 
 	stats_reset();
+	vcc_set(true);          /* pad power on (it's on by default anyway) */
+	k_msleep(10);           /* let the pad power up */
 
 	if (joybus_host_init(CONFIG_GC_DATA_PIN) != 0) {
 		printk("Bad CONFIG_GC_DATA_PIN %d\n", CONFIG_GC_DATA_PIN);
@@ -224,44 +384,100 @@ void role_run(void)
 	for (;;) {
 		/* (Re)detect the pad and announce its origin. */
 		detect_pad(&origin);
+
+		enum pwr_state st = PWR_ACTIVE;
+		int64_t now = k_uptime_get();
+		int64_t last_activity = now;
+		int64_t last_send = now;
+		int64_t last_origin_ms = now;
+		int64_t next_print = now + 1000;
+		int64_t next_led = now;
+		int bad_streak = 0;
+		bool link_up = true;     /* assume yes until sends start failing */
+		int fail_streak = 0;
+		int64_t link_lost_at = 0;
+		int64_t last_probe = 0;
+
+		hfclk_on();
 		pkt.type = GC_PKT_ORIGIN;
 		pkt.seq = seq++;
 		pkt.data = origin;
 		radio_send(&pkt);
-
-		int64_t last_origin_ms = k_uptime_get();
-		int64_t next_print = last_origin_ms + 1000;
-
-		bad_streak = 0;
-		k_timer_start(&poll_timer, K_USEC(CONFIG_APP_POLL_INTERVAL_US),
-			      K_USEC(CONFIG_APP_POLL_INTERVAL_US));
+		act_ref = origin.state;
+		set_poll_rate(st);
 
 		while (bad_streak < PAD_LOST_POLLS) {
 			k_sem_take(&tick, K_FOREVER);
+			now = k_uptime_get();
 
 			/* 1. Joybus */
 			uint32_t cmd = GC_POLL | (current_rumble() ? GC_RUMBLE_BIT : 0);
 			GC_Payload p;
 
-			if (joybus_host_poll(cmd, &p) == 0 && gc_payload_valid(&p)) {
-				stats.polls_ok++;
-				bad_streak = 0;
-				pad = p;
+			if (joybus_host_poll(cmd, &p) != 0 || !gc_payload_valid(&p)) {
+				stats.polls_bad++;
+				bad_streak++;
+				continue;
+			}
+			stats.polls_ok++;
+			bad_streak = 0;
+			pad = p;
 
-				/* 2. Radio */
+			/* Activity: a button change, or a real stick/trigger move. */
+			if (buttons_changed(&pad, &act_ref) ||
+			    analog_moved(&pad, &act_ref, CONFIG_APP_ACTIVITY_THRESH)) {
+				act_ref = pad;
+				last_activity = now;
+				if (st == PWR_DOZE) {
+					st = PWR_ACTIVE;
+					hfclk_on();
+					set_poll_rate(st);
+				}
+			}
+
+			/* 2. Radio. Linked: only when something changed, the
+			 * keepalive is due, or rumble is on (so "rumble off" arrives
+			 * quickly). Link lost: only a probe every LINK_PROBE_MS. */
+			bool changed = pad.byte0 != last_sent.byte0 ||
+				       pad.byte1 != last_sent.byte1 ||
+				       analog_moved(&pad, &last_sent, CONFIG_APP_ANALOG_DEADBAND);
+			bool want_send = link_up
+				? (changed || current_rumble() ||
+				   now - last_send >= CONFIG_APP_KEEPALIVE_MS)
+				: (now - last_probe >= CONFIG_APP_LINK_PROBE_MS);
+
+			if (want_send) {
 				pkt.type = GC_PKT_INPUT;
 				pkt.seq = seq++;
 				memset(&pkt.data, 0, sizeof(pkt.data));
 				pkt.data.state = pad;
-				radio_send(&pkt);
-			} else {
-				stats.polls_bad++;
-				bad_streak++;
+
+				bool ok = radio_send(&pkt);
+
+				last_sent = pad;
+				last_send = now;
+				last_probe = now;
+
+				if (ok) {
+					fail_streak = 0;
+					if (!link_up) {
+						/* Back: resend the origin right away, in
+						 * case the receiver was restarted. */
+						link_up = true;
+						if (st == PWR_ACTIVE) {
+							hfclk_on();
+						}
+						last_origin_ms = 0;
+					}
+				} else if (link_up &&
+					   ++fail_streak >= CONFIG_APP_LINK_LOSS_FAILS) {
+					link_up = false;
+					link_lost_at = now;
+					stats.link_lost++;
+				}
 			}
 
-			int64_t now = k_uptime_get();
-
-			if (now - last_origin_ms >= ORIGIN_RESEND_MS) {
+			if (link_up && now - last_origin_ms >= ORIGIN_RESEND_MS) {
 				pkt.type = GC_PKT_ORIGIN;
 				pkt.seq = seq++;
 				pkt.data = origin;
@@ -269,9 +485,47 @@ void role_run(void)
 				last_origin_ms = now;
 			}
 
+			/* Dozing or searching: crystal only on while sending. */
+			if (st == PWR_DOZE || !link_up) {
+				hfclk_off();
+			}
+
+			/* Status LED (off while dozing): short pulse every 2 s while
+			 * linked, longer blink every 1 s while searching. */
+			if (IS_ENABLED(CONFIG_APP_STATUS_LED) && st == PWR_ACTIVE) {
+				int64_t period = link_up ? LED_PERIOD_MS : LED_SEARCH_PERIOD_MS;
+				int64_t pulse = link_up ? LED_PULSE_MS : LED_SEARCH_PULSE_MS;
+
+				if (now >= next_led) {
+					led_set(true);
+					next_led = now + period;
+				} else if (now >= next_led - period + pulse) {
+					led_set(false);
+				}
+			}
+
+			/* Idle timers. */
+			int64_t idle = now - last_activity;
+
+			if (CONFIG_APP_SLEEP_MIN > 0 &&
+			    idle >= (int64_t)CONFIG_APP_SLEEP_MIN * 60 * 1000) {
+				power_off("No activity");
+			}
+			if (!link_up && CONFIG_APP_LINK_LOST_SLEEP_MIN > 0 &&
+			    now - link_lost_at >= (int64_t)CONFIG_APP_LINK_LOST_SLEEP_MIN * 60 * 1000) {
+				power_off("No receiver");
+			}
+			if (st == PWR_ACTIVE && CONFIG_APP_DOZE_S > 0 &&
+			    idle >= (int64_t)CONFIG_APP_DOZE_S * 1000) {
+				st = PWR_DOZE;
+				led_set(false);
+				hfclk_off();
+				set_poll_rate(st);
+			}
+
 			if (now >= next_print) {
 				next_print += 1000;
-				print_stats(&pad);
+				print_stats(&pad, st, link_up);
 			}
 		}
 

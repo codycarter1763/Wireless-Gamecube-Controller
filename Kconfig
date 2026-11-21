@@ -19,7 +19,10 @@ config APP_ESB_LINK
 	select GPIO
 	select CLOCK_CONTROL
 	select ESB
-	select ESB_CLOCK_INIT
+	# The receiver lets ESB keep the HF crystal on. The controller manages
+	# it itself so it can switch it off between sends while dozing.
+	select ESB_CLOCK_INIT if APP_ROLE_PRX
+	select POWEROFF if APP_ROLE_PTX
 
 choice APP_ROLE
 	prompt "Board role"
@@ -55,12 +58,109 @@ config GC_RX_NO_SLEEP
 	  doesn't matter on the USB/console-powered receiver.
 
 config APP_POLL_INTERVAL_US
-	int "Pad poll + send interval (us)"
+	int "Pad poll interval while active (us)"
 	default 1000
 	depends on APP_ROLE_PTX
 	help
-	  How often the controller board polls the pad and sends the result.
-	  One poll + send takes about 650 us, so keep this at 1000 or above.
+	  How often the controller board polls the pad while you're playing.
+	  One poll + send takes about 800 us, so keep this at 1000 or above.
+	  2000 roughly halves the polling cost for at most 1 ms more lag.
+
+menu "Controller power saving"
+	depends on APP_ROLE_PTX
+
+config APP_KEEPALIVE_MS
+	int "Send at least every N ms, even if nothing changed"
+	default 40
+	help
+	  Input is only sent when it changes, plus this keepalive. Must stay
+	  well under the receiver's 100 ms timeout, after which the console
+	  sees a neutral controller.
+
+config APP_ANALOG_DEADBAND
+	int "Stick/trigger change that counts as new input"
+	default 1
+	range 1 20
+	help
+	  1 sends every analog change (most precise). 2-3 ignores sensor noise
+	  on worn sticks, so fewer packets are sent while the pad sits still.
+
+config APP_ACTIVITY_THRESH
+	int "Stick/trigger movement that counts as 'someone is playing'"
+	default 12
+	help
+	  Button presses always count. Analog changes smaller than this
+	  (sensor noise, a resting thumb) don't reset the idle timers.
+
+config APP_DOZE_S
+	int "Seconds without activity before dozing (0 = never)"
+	default 60
+	help
+	  Doze: poll the pad at a low rate, HF crystal off between sends,
+	  status LED off. Any activity switches straight back to full rate.
+
+config APP_DOZE_POLL_MS
+	int "Pad poll interval while dozing (ms)"
+	default 16
+
+config APP_SLEEP_MIN
+	int "Minutes without activity before powering off (0 = never)"
+	default 10
+	help
+	  Power off: pad power (VCC) cut, nRF in System OFF (~a few uA).
+	  Wake with one press of the reset button, or GC_WAKE_PIN.
+
+config APP_LINK_LOSS_FAILS
+	int "Failed sends in a row before the link counts as lost"
+	default 25
+	help
+	  A send fails when all ESB retries go unanswered. While the link is
+	  lost, the controller stops sending on every input change and only
+	  probes every APP_LINK_PROBE_MS, until a probe is acknowledged.
+
+config APP_LINK_PROBE_MS
+	int "Probe interval while the link is lost (ms)"
+	default 200
+
+config APP_LINK_LOST_SLEEP_MIN
+	int "Minutes without a receiver before powering off (0 = never)"
+	default 5
+	help
+	  Powers off even while buttons are being pressed: without a receiver
+	  the controller can't do anything useful.
+
+config GC_VCC_CTRL_PIN
+	int "VCC switch control pin (P0.x, -1 = board has none)"
+	default 13
+	range -1 31
+	help
+	  Pro Micro nRF52840 / nice!nano boards switch their VCC pin's 3.3V
+	  with P0.13. The pad is powered from VCC, so turning it off cuts the
+	  pad's power while the board sleeps.
+
+config GC_VCC_ON_HIGH
+	bool "VCC is on when the control pin is high"
+	default y
+	help
+	  y: SuperMini / nice!nano v2 clones (low = VCC off).
+	  n: original nice!nano v1 (high = VCC off).
+
+config GC_WAKE_PIN
+	int "Optional wake button pin (P0.x, button to GND; -1 = reset only)"
+	default -1
+	range -1 31
+
+config APP_STATUS_LED
+	bool "Status LED pulse while connected"
+	default y
+	help
+	  A 20 ms pulse every 2 s while active. Off while dozing.
+
+config APP_RTT_STATS
+	bool "Measure radio round-trip time (keeps a 1 MHz timer running)"
+	default y
+
+endmenu
 
 config APP_RF_CHANNEL
 	int "ESB RF channel (2400 + n MHz)"

@@ -24,6 +24,11 @@ void led_toggle(void)
 	gpio_pin_toggle_dt(&led);
 }
 
+void led_set(bool on)
+{
+	gpio_pin_set_dt(&led, on);
+}
+
 void dbg_pin_set(bool on)
 {
 	if (on) {
@@ -33,14 +38,24 @@ void dbg_pin_set(bool on)
 	}
 }
 
+/* The 1 MHz timer is only for radio round-trip stats; a running TIMER keeps
+ * the 16 MHz clock requested, so battery builds leave it off. */
+#define RTT_TIMER_ON IS_ENABLED(CONFIG_APP_RTT_STATS)
+
 uint32_t us_now(void)
 {
+	if (!RTT_TIMER_ON) {
+		return 0;
+	}
 	US_TIMER->TASKS_CAPTURE[0] = 1;
 	return US_TIMER->CC[0];
 }
 
 uint32_t us_now_isr(void)
 {
+	if (!RTT_TIMER_ON) {
+		return 0;
+	}
 	US_TIMER->TASKS_CAPTURE[1] = 1;
 	return US_TIMER->CC[1];
 }
@@ -91,7 +106,9 @@ int main(void)
 	gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
 	nrf_gpio_cfg_output(DBG_PIN);
 	dbg_pin_set(false);
-	us_timer_init();
+	if (RTT_TIMER_ON) {
+		us_timer_init();
+	}
 
 	err = radio_init(IS_ENABLED(CONFIG_APP_ROLE_PRX));
 	if (err) {
