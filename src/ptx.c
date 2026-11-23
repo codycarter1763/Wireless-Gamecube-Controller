@@ -38,7 +38,6 @@
  * If the pad stops answering, we go back to detecting it.
  */
 #include <esb.h>
-#include <stdlib.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/clock_control.h>
@@ -49,6 +48,7 @@
 #include "gc_protocol.h"
 #include "gc_debug.h"
 #include "joybus.h"
+#include "gc_logic.h"
 
 #define ORIGIN_RESEND_MS    500
 #define RUMBLE_TIMEOUT_MS   500   /* no ACK payload for this long -> rumble off */
@@ -62,8 +62,6 @@
  * mode, entered by soft reset" (DFU_MAGIC_OTA_RESET in its src/main.c). */
 #define DFU_MAGIC_OTA_RESET 0xA8
 #define OTA_FEEDBACK_MS     1000   /* start flickering the LED after this */
-#define OTA_BYTE0_MASK      (A_BTN)
-#define OTA_BYTE1_MASK      (L_BTN | R_BTN | Z_BTN)
 
 enum pwr_state { PWR_ACTIVE, PWR_DOZE };
 
@@ -256,31 +254,6 @@ static bool radio_send(const GC_TxPacket *pkt)
 }
 
 /* ------------------------------------------------------------------ */
-/* Input change / activity detection                                   */
-/* ------------------------------------------------------------------ */
-
-/* Any analog value (sticks, triggers) differs by at least `thresh`. */
-static bool analog_moved(const GC_Payload *a, const GC_Payload *b, int thresh)
-{
-	const uint8_t *pa = &a->joy_X_val;
-	const uint8_t *pb = &b->joy_X_val;
-
-	for (int i = 0; i < 6; i++) {
-		if (abs((int)pa[i] - (int)pb[i]) >= thresh) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool buttons_changed(const GC_Payload *a, const GC_Payload *b)
-{
-	return ((a->byte0 ^ b->byte0) & (START_BTN | Y_BTN | X_BTN | B_BTN | A_BTN)) ||
-	       ((a->byte1 ^ b->byte1) & (L_BTN | R_BTN | Z_BTN | D_UP_BTN | D_DOWN_BTN |
-					  D_RIGHT_BTN | D_LEFT_BTN));
-}
-
-/* ------------------------------------------------------------------ */
 /* Pad                                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -411,7 +384,6 @@ void role_run(void)
 	GC_Payload pad = {0};
 	GC_Payload last_sent = {0};
 	GC_Payload act_ref = {0};
-	GC_Payload prev = {0};
 	uint8_t seq = 0;
 
 	stats_reset();
@@ -435,13 +407,11 @@ void role_run(void)
 		int64_t next_print = now + 1000;
 		int64_t next_led = now;
 		int bad_streak = 0;
-		bool link_up = true;     /* assume yes until sends start failing */
-		int64_t last_ack = now;
-		int64_t link_lost_at = 0;
-		int64_t last_probe = 0;
-		bool fast = true;        /* adaptive poll rate (ACTIVE only) */
-		int64_t last_change = now;
+		struct gc_link link;     /* assume up until sends start failing */
+		struct gc_rate rate;     /* adaptive poll rate (ACTIVE only) */
 		int64_t combo_since = -1; /* OTA combo held since, or -1 */
+
+		gc_link_init(&link, now);
 
 		hfclk_on();
 		pkt.type = GC_PKT_ORIGIN;
@@ -449,8 +419,8 @@ void role_run(void)
 		pkt.data = origin;
 		radio_send(&pkt);
 		act_ref = origin.state;
-		prev = origin.state;
-		set_poll_rate(st, fast);
+		gc_rate_init(&rate, &origin.state, now);
+		set_poll_rate(st, rate.fast);
 
 		while (bad_streak < PAD_LOST_POLLS) {
 			k_sem_take(&tick, K_FOREVER);
@@ -470,52 +440,35 @@ void role_run(void)
 			pad = p;
 
 			/* Adaptive poll rate: a real change means someone's moving;
-			 * keep polling fast for a while after. Compared against the
-			 * state at the last real change (not the previous poll), so
-			 * sensor noise around a resting position never counts. */
-			bool input_changed = pad.byte0 != prev.byte0 ||
-					     pad.byte1 != prev.byte1 ||
-					     analog_moved(&pad, &prev, CONFIG_APP_FAST_THRESH);
-
-			if (input_changed) {
-				prev = pad;
-				last_change = now;
-				if (st == PWR_ACTIVE && !fast) {
-					fast = true;
-					set_poll_rate(st, fast);
-				}
-			} else if (st == PWR_ACTIVE && fast &&
-				   now - last_change >= CONFIG_APP_FAST_HOLD_MS) {
-				fast = false;
-				set_poll_rate(st, fast);
+			 * keep polling fast for a while after (see gc_rate_update).
+			 * The rate only applies while ACTIVE. */
+			if (gc_rate_update(&rate, &pad, now, CONFIG_APP_FAST_THRESH,
+					   CONFIG_APP_FAST_HOLD_MS) && st == PWR_ACTIVE) {
+				set_poll_rate(st, rate.fast);
 			}
 
 			/* Activity: a button change, or a real stick/trigger move. */
-			if (buttons_changed(&pad, &act_ref) ||
-			    analog_moved(&pad, &act_ref, CONFIG_APP_ACTIVITY_THRESH)) {
+			if (gc_buttons_changed(&pad, &act_ref) ||
+			    gc_analog_moved(&pad, &act_ref, CONFIG_APP_ACTIVITY_THRESH)) {
 				act_ref = pad;
 				last_activity = now;
 				if (st == PWR_DOZE) {
 					st = PWR_ACTIVE;
-					fast = true;
-					last_change = now;
+					gc_rate_init(&rate, &pad, now);
 					hfclk_on();
-					set_poll_rate(st, fast);
+					set_poll_rate(st, rate.fast);
 				}
 			}
 
 			/* 2. Radio. Linked: only when something changed, the
 			 * keepalive is due, or rumble is on (so "rumble off" arrives
 			 * quickly). Link lost: only a probe every LINK_PROBE_MS. */
-			bool changed = pad.byte0 != last_sent.byte0 ||
-				       pad.byte1 != last_sent.byte1 ||
-				       analog_moved(&pad, &last_sent, CONFIG_APP_ANALOG_DEADBAND);
-			bool want_send = link_up
-				? (changed || current_rumble() ||
-				   now - last_send >= CONFIG_APP_KEEPALIVE_MS)
-				: (now - last_probe >= CONFIG_APP_LINK_PROBE_MS);
+			bool changed = gc_input_changed(&pad, &last_sent,
+							CONFIG_APP_ANALOG_DEADBAND);
 
-			if (want_send) {
+			if (gc_link_want_send(&link, now, changed, current_rumble(),
+					      last_send, CONFIG_APP_KEEPALIVE_MS,
+					      CONFIG_APP_LINK_PROBE_MS)) {
 				pkt.type = GC_PKT_INPUT;
 				pkt.seq = seq++;
 				memset(&pkt.data, 0, sizeof(pkt.data));
@@ -525,28 +478,25 @@ void role_run(void)
 
 				last_sent = pad;
 				last_send = now;
-				last_probe = now;
 
-				if (ok) {
-					last_ack = now;
-					if (!link_up) {
-						/* Back: resend the origin right away, in
-						 * case the receiver was restarted. */
-						link_up = true;
-						if (st == PWR_ACTIVE) {
-							hfclk_on();
-						}
-						last_origin_ms = 0;
+				switch (gc_link_on_send(&link, now, ok, CONFIG_APP_LINK_LOSS_MS)) {
+				case GC_LINK_RESTORED:
+					/* Back: resend the origin right away, in
+					 * case the receiver was restarted. */
+					if (st == PWR_ACTIVE) {
+						hfclk_on();
 					}
-				} else if (link_up &&
-					   now - last_ack >= CONFIG_APP_LINK_LOSS_MS) {
-					link_up = false;
-					link_lost_at = now;
+					last_origin_ms = 0;
+					break;
+				case GC_LINK_LOST:
 					stats.link_lost++;
+					break;
+				default:
+					break;
 				}
 			}
 
-			if (link_up && now - last_origin_ms >= ORIGIN_RESEND_MS) {
+			if (link.up && now - last_origin_ms >= ORIGIN_RESEND_MS) {
 				pkt.type = GC_PKT_ORIGIN;
 				pkt.seq = seq++;
 				pkt.data = origin;
@@ -555,21 +505,18 @@ void role_run(void)
 			}
 
 			/* Dozing or searching: crystal only on while sending. */
-			if (st == PWR_DOZE || !link_up) {
+			if (st == PWR_DOZE || !link.up) {
 				hfclk_off();
 			}
 
 			/* OTA combo: L + R + Z + A held continuously. */
 			bool ota_feedback = false;
+			bool was_held = combo_since >= 0;
+			int64_t held = gc_combo_hold(&combo_since,
+						     IS_ENABLED(CONFIG_APP_OTA_COMBO) &&
+						     gc_ota_combo_pressed(&pad), now);
 
-			if (IS_ENABLED(CONFIG_APP_OTA_COMBO) &&
-			    (pad.byte0 & OTA_BYTE0_MASK) == OTA_BYTE0_MASK &&
-			    (pad.byte1 & OTA_BYTE1_MASK) == OTA_BYTE1_MASK) {
-				if (combo_since < 0) {
-					combo_since = now;
-				}
-				int64_t held = now - combo_since;
-
+			if (held >= 0) {
 #if defined(CONFIG_APP_OTA_HOLD_MS)
 				if (held >= CONFIG_APP_OTA_HOLD_MS) {
 					enter_ota();
@@ -580,16 +527,15 @@ void role_run(void)
 					led_set(((now / 100) & 1) != 0);
 					ota_feedback = true;
 				}
-			} else if (combo_since >= 0) {
-				combo_since = -1;
+			} else if (was_held) {
 				led_set(false);
 			}
 
 			/* Status LED (off while dozing): short pulse every 2 s while
 			 * linked, longer blink every 1 s while searching. */
 			if (IS_ENABLED(CONFIG_APP_STATUS_LED) && st == PWR_ACTIVE && !ota_feedback) {
-				int64_t period = link_up ? LED_PERIOD_MS : LED_SEARCH_PERIOD_MS;
-				int64_t pulse = link_up ? LED_PULSE_MS : LED_SEARCH_PULSE_MS;
+				int64_t period = link.up ? LED_PERIOD_MS : LED_SEARCH_PERIOD_MS;
+				int64_t pulse = link.up ? LED_PULSE_MS : LED_SEARCH_PULSE_MS;
 
 				if (now >= next_led) {
 					led_set(true);
@@ -606,8 +552,8 @@ void role_run(void)
 			    idle >= (int64_t)CONFIG_APP_SLEEP_MIN * 60 * 1000) {
 				power_off("No activity");
 			}
-			if (!link_up && CONFIG_APP_LINK_LOST_SLEEP_MIN > 0 &&
-			    now - link_lost_at >= (int64_t)CONFIG_APP_LINK_LOST_SLEEP_MIN * 60 * 1000) {
+			if (!link.up && CONFIG_APP_LINK_LOST_SLEEP_MIN > 0 &&
+			    now - link.lost_at >= (int64_t)CONFIG_APP_LINK_LOST_SLEEP_MIN * 60 * 1000) {
 				power_off("No receiver");
 			}
 			if (st == PWR_ACTIVE && CONFIG_APP_DOZE_S > 0 &&
@@ -615,12 +561,12 @@ void role_run(void)
 				st = PWR_DOZE;
 				led_set(false);
 				hfclk_off();
-				set_poll_rate(st, fast);
+				set_poll_rate(st, rate.fast);
 			}
 
 			if (now >= next_print) {
 				next_print += 1000;
-				print_stats(&pad, st, fast, link_up);
+				print_stats(&pad, st, rate.fast, link.up);
 			}
 		}
 

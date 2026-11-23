@@ -17,6 +17,7 @@
 #include "gc_protocol.h"
 #include "gc_debug.h"
 #include "joybus.h"
+#include "gc_logic.h"
 
 #define INPUT_STALE_MS  CONFIG_APP_RX_STALE_MS
 
@@ -31,16 +32,12 @@ struct prx_stats {
 };
 
 static struct prx_stats stats;
-static uint8_t expected_seq;
-static bool have_seq;
-static uint8_t s_behind_run;   /* consecutive packets behind expected_seq */
 
 /* A packet whose seq is behind the one we expect is a duplicate (its ACK
  * was lost and the retry got through as a new packet) or arrived out of
  * order. Applying it would briefly bring back an older input, e.g. a
- * button you've already released, so it's ignored. After this many in a
- * row we assume the controller restarted its count and resync. */
-#define BEHIND_RESYNC  8
+ * button you've already released, so it's ignored (see gc_seq_check). */
+static struct gc_seq s_seq;
 
 /* Latest state from the controller board. Written in the ESB ISR. */
 static GC_Payload s_input;
@@ -82,11 +79,7 @@ bool gc_rx_get_origin(GC_Origin *out)
 /* Neutral = origin sticks/triggers, no buttons. */
 static GC_Payload neutral_input(void)
 {
-	GC_Payload n = s_origin.state;
-
-	n.byte0 = 0;
-	n.byte1 = GC_BYTE1_ALWAYS_ONE;
-	return n;
+	return gc_neutral_input(&s_origin);
 }
 
 /* ------------------------------------------------------------------ */
@@ -129,23 +122,16 @@ void app_esb_handler(const struct esb_evt *event)
 		}
 		memcpy(&pkt, rx.data, sizeof(pkt));
 
-		uint8_t gap = (uint8_t)(pkt.seq - expected_seq);
-		bool behind = have_seq && gap >= 128;
+		uint32_t missed;
 
-		/* Origin packets always resync: the controller sends one first
-		 * after every (re)start, when its seq starts over. */
-		if (behind && pkt.type != GC_PKT_ORIGIN && ++s_behind_run < BEHIND_RESYNC) {
+		if (gc_seq_check(&s_seq, pkt.seq, pkt.type == GC_PKT_ORIGIN,
+				 &missed) == GC_SEQ_DUP) {
 			stats.dups++;
 			queue_ack();   /* keep rumble flowing in the ACKs */
 			dbg_pin_set(false);
 			continue;
 		}
-		if (have_seq && !behind) {
-			stats.missed += gap;
-		}
-		s_behind_run = 0;
-		expected_seq = pkt.seq + 1;
-		have_seq = true;
+		stats.missed += missed;
 
 		if (pkt.type == GC_PKT_INPUT) {
 			s_input = pkt.data.state;
@@ -241,6 +227,8 @@ static void print_stats(void)
 void role_run(void)
 {
 	int err;
+
+	gc_seq_init(&s_seq);
 
 	err = joybus_target_init(CONFIG_GC_DATA_PIN);
 	if (err) {
