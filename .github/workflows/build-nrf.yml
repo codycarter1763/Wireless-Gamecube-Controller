@@ -1,4 +1,4 @@
-name: Build nRF52840 firmware
+name: Test and build nRF52840 firmware
 
 on:
   push:
@@ -14,7 +14,57 @@ env:
   BOARD: promicro_nrf52840/nrf52840/uf2
 
 jobs:
+  # Unit tests for the pure logic (src/gc_logic.c) on the native_sim board:
+  # runs on the CI machine itself, no hardware needed. Firmware is only
+  # built if these pass.
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q device-tree-compiler ninja-build
+          pip install west
+
+      # The SDK checkout (~1.8 GB) is cached per NCS version.
+      - name: Cache nRF Connect SDK
+        id: ncs-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NCS_DIR }}
+          key: ncs-${{ env.NCS_VERSION }}-min-v1
+
+      - name: Fetch nRF Connect SDK
+        if: steps.ncs-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$NCS_DIR" && cd "$NCS_DIR"
+          west init -m https://github.com/nrfconnect/sdk-nrf --mr "$NCS_VERSION"
+          # Only the modules this project needs (ESB, nrfx, Zephyr, libc).
+          west config manifest.project-filter -- \
+            "-.*,+zephyr,+nrfxlib,+hal_nordic,+cmsis_6,+cmsis,+segger,+mbedtls,+oberon-psa-crypto,+mcuboot,+tinycrypt,+picolibc,+zcbor,+trusted-firmware-m,+psa-arch-tests"
+          west update --narrow -o=--depth=1 zephyr
+          west update --narrow -o=--depth=1
+
+      - name: Install Python requirements
+        run: pip install -r "$NCS_DIR/zephyr/scripts/requirements-base.txt"
+
+      - name: Run unit tests (native_sim)
+        env:
+          ZEPHYR_TOOLCHAIN_VARIANT: host
+        run: |
+          cd "$NCS_DIR"
+          west build -p -b native_sim/native/64 --no-sysbuild \
+            -d "$GITHUB_WORKSPACE/build_tests" \
+            "$GITHUB_WORKSPACE/$APP_DIR/tests/unit" -t run
+
   build:
+    needs: test
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
