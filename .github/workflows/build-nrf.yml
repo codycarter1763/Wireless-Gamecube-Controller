@@ -20,9 +20,9 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -30,12 +30,12 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q device-tree-compiler ninja-build
-          pip install west
+          pip install west gcovr
 
       # The SDK checkout (~1.8 GB) is cached per NCS version.
       - name: Cache nRF Connect SDK
         id: ncs-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.NCS_DIR }}
           key: ncs-${{ env.NCS_VERSION }}-min-v1
@@ -61,7 +61,27 @@ jobs:
           cd "$NCS_DIR"
           west build -p -b native_sim/native/64 --no-sysbuild \
             -d "$GITHUB_WORKSPACE/build_tests" \
-            "$GITHUB_WORKSPACE/$APP_DIR/tests/unit" -t run
+            "$GITHUB_WORKSPACE/$APP_DIR/tests/unit" -t run \
+            -- -DCONFIG_COVERAGE=y
+
+      # Coverage of src/gc_logic.c: summary on the run page, HTML report as
+      # an artifact. Fails if line coverage drops below 90 %.
+      - name: Coverage report
+        run: |
+          mkdir -p coverage
+          cd build_tests
+          gcovr -r "$GITHUB_WORKSPACE/$APP_DIR" --filter '.*/src/gc_logic\.c' \
+            --html-details ../coverage/index.html \
+            --txt ../coverage/summary.txt --fail-under-line 90 .
+          { echo '### Unit test coverage'; echo '```'; cat ../coverage/summary.txt; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage
+          path: coverage/
 
   build:
     needs: test
@@ -81,9 +101,9 @@ jobs:
             conf: "prx.conf"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -97,7 +117,7 @@ jobs:
       # The SDK checkout (~1.8 GB) is cached per NCS version.
       - name: Cache nRF Connect SDK
         id: ncs-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.NCS_DIR }}
           key: ncs-${{ env.NCS_VERSION }}-min-v1
@@ -136,7 +156,7 @@ jobs:
             "gc_${{ matrix.name }}_ota.zip"
 
       - name: Upload firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: firmware-${{ matrix.name }}
           path: |
