@@ -69,13 +69,41 @@ config APP_POLL_INTERVAL_US
 menu "Controller power saving"
 	depends on APP_ROLE_PTX
 
+config APP_POLL_SLOW_US
+	int "Pad poll interval while active but nothing is changing (us)"
+	default 4000
+	help
+	  Adaptive poll rate: poll at APP_POLL_INTERVAL_US while the input is
+	  changing, and drop to this rate after APP_FAST_HOLD_MS with no
+	  change. The first change seen switches straight back to the fast
+	  rate, so only that first change waits up to this interval (4 ms by
+	  default, well under one 16.7 ms frame). Each poll keeps the CPU busy
+	  for ~370 us, so 4000 cuts idle-hands polling cost by ~75%.
+	  Set equal to APP_POLL_INTERVAL_US to always poll fast.
+
+config APP_FAST_HOLD_MS
+	int "Stay at the fast poll rate this long after the last change (ms)"
+	default 100
+
+config APP_FAST_THRESH
+	int "Stick/trigger movement that selects the fast rate"
+	default 3
+	range 1 20
+	help
+	  Button changes always select the fast rate. Analog values are
+	  compared with their value at the last real change, so this must be
+	  larger than the sensor noise's full range: 3 for a stick that wobbles
+	  +-1 at rest, 5 for a worn one that wobbles +-2. Too low and a
+	  resting pad stays at 1 kHz.
+
 config APP_KEEPALIVE_MS
 	int "Send at least every N ms, even if nothing changed"
-	default 40
+	default 20
 	help
 	  Input is only sent when it changes, plus this keepalive. Must stay
-	  well under the receiver's 100 ms timeout, after which the console
-	  sees a neutral controller.
+	  well under the receiver's APP_RX_STALE_MS (250 ms), after which the
+	  console sees a neutral controller: with 20 ms, about a dozen packets
+	  in a row must be lost before control drops.
 
 config APP_ANALOG_DEADBAND
 	int "Stick/trigger change that counts as new input"
@@ -110,17 +138,18 @@ config APP_SLEEP_MIN
 	  Power off: pad power (VCC) cut, nRF in System OFF (~a few uA).
 	  Wake with one press of the reset button, or GC_WAKE_PIN.
 
-config APP_LINK_LOSS_FAILS
-	int "Failed sends in a row before the link counts as lost"
-	default 25
+config APP_LINK_LOSS_MS
+	int "No acknowledged packet for this long -> link counts as lost (ms)"
+	default 1000
 	help
-	  A send fails when all ESB retries go unanswered. While the link is
-	  lost, the controller stops sending on every input change and only
-	  probes every APP_LINK_PROBE_MS, until a probe is acknowledged.
+	  While the link is lost, the controller stops sending on every input
+	  change and only probes every APP_LINK_PROBE_MS, until a probe is
+	  acknowledged. Time-based, so a burst of failures on a lossy link
+	  doesn't switch to probing while packets are still getting through.
 
 config APP_LINK_PROBE_MS
 	int "Probe interval while the link is lost (ms)"
-	default 200
+	default 100
 
 config APP_LINK_LOST_SLEEP_MIN
 	int "Minutes without a receiver before powering off (0 = never)"
@@ -149,6 +178,22 @@ config GC_WAKE_PIN
 	int "Optional wake button pin (P0.x, button to GND; -1 = reset only)"
 	default -1
 	range -1 31
+
+config APP_OTA_COMBO
+	bool "Button combo reboots into the Bluetooth (OTA) bootloader"
+	default y
+	help
+	  Hold L + R + Z + A (both triggers fully clicked) for APP_OTA_HOLD_MS
+	  and the controller reboots into the Adafruit bootloader's OTA mode.
+	  It then advertises over Bluetooth as "AdaDFU"; send it a DFU package
+	  (gc_controller_ota.zip from CI) with the nRF Connect or nRF Toolbox
+	  phone app. The bootloader stays in OTA mode until it's updated or
+	  reset/power-cycled.
+
+config APP_OTA_HOLD_MS
+	int "How long the OTA combo must be held (ms)"
+	default 5000
+	depends on APP_OTA_COMBO
 
 config APP_STATUS_LED
 	bool "Status LED pulse while connected"
@@ -180,7 +225,32 @@ config APP_RETRANSMIT_DELAY_US
 
 config APP_RETRANSMIT_COUNT
 	int "ESB retransmit count"
-	default 3
+	default 8
+	range 0 15
+	help
+	  Extra attempts when no ACK arrives. On a lossy link (hands, body or
+	  the console in the way) more retries make a big difference: with a
+	  50% chance per attempt, 3 retries lose ~6% of packets, 8 lose ~0.2%.
+	  Retries only happen when an attempt fails, so this costs nothing on a
+	  good link.
+
+config APP_TX_POWER
+	int "Radio TX power (dBm)"
+	default 8
+	help
+	  Valid on nRF52840: -40, -20, -16, -12, -8, -4, 0, 2, 3, 4, 5, 6, 7, 8.
+	  +8 costs ~10 mA more only while actually transmitting (~90 us per
+	  packet), i.e. well under 1 mA on average, and buys ~8 dB of link
+	  margin. Applies to both boards (the receiver transmits the ACKs).
+
+config APP_RX_STALE_MS
+	int "Receiver: no packet for this long -> console sees neutral (ms)"
+	default 250
+	depends on APP_ROLE_PRX
+	help
+	  Safety net if the controller dies or goes out of range. Must be well
+	  above the controller's keepalive (APP_KEEPALIVE_MS, 20 ms) so a few
+	  lost packets in a row don't drop control.
 
 config APP_DEBUG_PIN
 	int "Debug GPIO (P0.x) for scope / logic analyzer"

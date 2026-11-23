@@ -21,9 +21,14 @@ jobs:
       matrix:
         include:
           - role: ptx
-            name: controller
+            name: controller          # battery build (default)
+            conf: "ptx.conf"
+          - role: ptx
+            name: controller-debug    # + USB serial console, stats
+            conf: "ptx.conf;debug.conf"
           - role: prx
             name: receiver
+            conf: "prx.conf"
 
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +42,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q gcc-arm-none-eabi libnewlib-arm-none-eabi \
             device-tree-compiler ninja-build
-          pip install west
+          pip install west adafruit-nrfutil
 
       # The SDK checkout (~1.8 GB) is cached per NCS version.
       - name: Cache nRF Connect SDK
@@ -61,21 +66,31 @@ jobs:
       - name: Install Python requirements
         run: pip install -r "$NCS_DIR/zephyr/scripts/requirements-base.txt"
 
-      - name: Build ${{ matrix.name }} (${{ matrix.role }})
+      - name: Build ${{ matrix.name }}
         run: |
           cd "$NCS_DIR"
           west build -p -b "$BOARD" --no-sysbuild \
-            -d "$GITHUB_WORKSPACE/build_${{ matrix.role }}" \
+            -d "$GITHUB_WORKSPACE/build_${{ matrix.name }}" \
             "$GITHUB_WORKSPACE/$APP_DIR" \
-            -- -DEXTRA_CONF_FILE=${{ matrix.role }}.conf
-          cp "$GITHUB_WORKSPACE/build_${{ matrix.role }}/zephyr/zephyr.uf2" \
-             "$GITHUB_WORKSPACE/gc_${{ matrix.name }}_${{ matrix.role }}.uf2"
+            -- "-DEXTRA_CONF_FILE=${{ matrix.conf }}"
+          cp "$GITHUB_WORKSPACE/build_${{ matrix.name }}/zephyr/zephyr.uf2" \
+             "$GITHUB_WORKSPACE/gc_${{ matrix.name }}.uf2"
+
+      # Bluetooth OTA package for the controller (L+R+Z+A for 5 s, then
+      # send this zip to "AdaDFU" with the nRF Connect / nRF Toolbox app).
+      - name: Make OTA package
+        if: matrix.role == 'ptx'
+        run: |
+          adafruit-nrfutil dfu genpkg --dev-type 0x0052 \
+            --application "build_${{ matrix.name }}/zephyr/zephyr.hex" \
+            "gc_${{ matrix.name }}_ota.zip"
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.name }}
           path: |
-            gc_${{ matrix.name }}_${{ matrix.role }}.uf2
-            build_${{ matrix.role }}/zephyr/zephyr.hex
-            build_${{ matrix.role }}/zephyr/zephyr.elf
+            gc_${{ matrix.name }}.uf2
+            gc_${{ matrix.name }}_ota.zip
+            build_${{ matrix.name }}/zephyr/zephyr.hex
+            build_${{ matrix.name }}/zephyr/zephyr.elf

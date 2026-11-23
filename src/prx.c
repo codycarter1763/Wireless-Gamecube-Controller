@@ -7,7 +7,7 @@
  *   those pre-encoded replies (see joybus_target.c).
  * - Rumble: the bit from the console's latest poll goes back to the
  *   controller board in the ESB ACK payload (GC_RxPacket).
- * - If the controller board goes quiet for 100 ms, the console gets neutral
+ * - If the controller board goes quiet for CONFIG_APP_RX_STALE_MS, the console gets neutral
  *   input instead of the last state, so nothing sticks held down.
  */
 #include <esb.h>
@@ -18,13 +18,14 @@
 #include "gc_debug.h"
 #include "joybus.h"
 
-#define INPUT_STALE_MS  100
+#define INPUT_STALE_MS  CONFIG_APP_RX_STALE_MS
 
 struct prx_stats {
 	uint32_t rx;
 	uint32_t inputs;
 	uint32_t origins;
 	uint32_t missed;     /* sequence gaps = packets the controller gave up on */
+	uint32_t dups;       /* duplicate / out-of-order packets, ignored */
 	int32_t rssi_sum;    /* ESB reports RSSI as a positive number, -dBm */
 	uint32_t ack_queue_full;
 };
@@ -32,6 +33,14 @@ struct prx_stats {
 static struct prx_stats stats;
 static uint8_t expected_seq;
 static bool have_seq;
+static uint8_t s_behind_run;   /* consecutive packets behind expected_seq */
+
+/* A packet whose seq is behind the one we expect is a duplicate (its ACK
+ * was lost and the retry got through as a new packet) or arrived out of
+ * order. Applying it would briefly bring back an older input, e.g. a
+ * button you've already released, so it's ignored. After this many in a
+ * row we assume the controller restarted its count and resync. */
+#define BEHIND_RESYNC  8
 
 /* Latest state from the controller board. Written in the ESB ISR. */
 static GC_Payload s_input;
@@ -120,9 +129,21 @@ void app_esb_handler(const struct esb_evt *event)
 		}
 		memcpy(&pkt, rx.data, sizeof(pkt));
 
-		if (have_seq && pkt.seq != expected_seq) {
-			stats.missed += (uint8_t)(pkt.seq - expected_seq);
+		uint8_t gap = (uint8_t)(pkt.seq - expected_seq);
+		bool behind = have_seq && gap >= 128;
+
+		/* Origin packets always resync: the controller sends one first
+		 * after every (re)start, when its seq starts over. */
+		if (behind && pkt.type != GC_PKT_ORIGIN && ++s_behind_run < BEHIND_RESYNC) {
+			stats.dups++;
+			queue_ack();   /* keep rumble flowing in the ACKs */
+			dbg_pin_set(false);
+			continue;
 		}
+		if (have_seq && !behind) {
+			stats.missed += gap;
+		}
+		s_behind_run = 0;
 		expected_seq = pkt.seq + 1;
 		have_seq = true;
 
@@ -209,8 +230,8 @@ static void print_stats(void)
 	gc_format_payload(&in, line, sizeof(line));
 	printk("%s | %s | rumble %u\n", line, fresh ? "live" : "STALE->neutral",
 	       joybus_target_rumble());
-	printk("  radio rx %u (input %u origin %u) missed %u rssi -%d dBm | origin %s\n",
-	       s.rx, s.inputs, s.origins, s.missed,
+	printk("  radio rx %u (input %u origin %u) missed %u dup %u rssi -%d dBm | origin %s\n",
+	       s.rx, s.inputs, s.origins, s.missed, s.dups,
 	       s.rx ? (int)(s.rssi_sum / (int32_t)s.rx) : 0,
 	       have_org ? "ok" : "not yet");
 	printk("  console polls %u origin %u id %u | errors %u unknown %u late %u\n",

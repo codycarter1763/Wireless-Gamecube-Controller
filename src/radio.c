@@ -23,7 +23,7 @@ int radio_init(bool prx)
 	config.event_handler = app_esb_handler;
 	config.bitrate = ESB_BITRATE_2MBPS;
 	config.crc = ESB_CRC_16BIT;
-	config.tx_output_power = 0;               /* dBm; nRF52840 can do up to +8 */
+	config.tx_output_power = CONFIG_APP_TX_POWER;   /* dBm */
 	config.retransmit_delay = CONFIG_APP_RETRANSMIT_DELAY_US;
 	config.retransmit_count = CONFIG_APP_RETRANSMIT_COUNT;
 	config.tx_mode = ESB_TXMODE_AUTO;         /* esb_write_payload() sends now */

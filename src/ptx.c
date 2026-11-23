@@ -11,8 +11,11 @@
  *
  * Power states (all timed from the last real activity: a button change or a
  * stick/trigger movement of at least CONFIG_APP_ACTIVITY_THRESH):
- *   ACTIVE  poll every CONFIG_APP_POLL_INTERVAL_US, HF crystal kept on so a
- *           send never waits for it.
+ *   ACTIVE  HF crystal kept on so a send never waits for it. Adaptive poll
+ *           rate: every CONFIG_APP_POLL_INTERVAL_US (1 kHz) while the input
+ *           is changing; after CONFIG_APP_FAST_HOLD_MS with no change, every
+ *           CONFIG_APP_POLL_SLOW_US (250 Hz). The first change switches
+ *           straight back to fast.
  *   DOZE    after CONFIG_APP_DOZE_S: poll every CONFIG_APP_DOZE_POLL_MS, HF
  *           crystal on only while sending, status LED off. Any activity
  *           returns to ACTIVE immediately.
@@ -21,11 +24,14 @@
  * A button held down without moving is not "activity", but it is still
  * sent every keepalive, so the console never sees it released.
  *
- * Link loss: after CONFIG_APP_LINK_LOSS_FAILS failed sends in a row (no ACK
- * after all retries), the controller stops sending on input changes and
- * just probes every CONFIG_APP_LINK_PROBE_MS with the HF crystal off in
- * between. The first acknowledged probe restores the link (and resends the
+ * Link loss: after CONFIG_APP_LINK_LOSS_MS with no acknowledged packet at
+ * all, the controller stops sending on input changes and just probes every
+ * CONFIG_APP_LINK_PROBE_MS with the HF crystal off in between. The first acknowledged probe restores the link (and resends the
  * origin). No receiver for CONFIG_APP_LINK_LOST_SLEEP_MIN -> power off.
+ *
+ * OTA: holding L + R + Z + A for CONFIG_APP_OTA_HOLD_MS reboots into the
+ * Adafruit bootloader's Bluetooth DFU mode (GPREGRET = 0xA8). The LED
+ * flickers while the combo is counting and stays on once it triggers.
  *
  * The origin (neutral stick/trigger values) is sent at startup and then
  * every 500 ms, so a receiver that powers up late still gets it.
@@ -51,6 +57,13 @@
 #define LED_PULSE_MS        20
 #define LED_SEARCH_PERIOD_MS 1000 /* blink while searching for the receiver */
 #define LED_SEARCH_PULSE_MS 50
+
+/* Adafruit nRF52 bootloader: GPREGRET value meaning "start in BLE OTA DFU
+ * mode, entered by soft reset" (DFU_MAGIC_OTA_RESET in its src/main.c). */
+#define DFU_MAGIC_OTA_RESET 0xA8
+#define OTA_FEEDBACK_MS     1000   /* start flickering the LED after this */
+#define OTA_BYTE0_MASK      (A_BTN)
+#define OTA_BYTE1_MASK      (L_BTN | R_BTN | Z_BTN)
 
 enum pwr_state { PWR_ACTIVE, PWR_DOZE };
 
@@ -329,7 +342,27 @@ static void power_off(const char *why)
 	sys_poweroff();
 }
 
-static void print_stats(const GC_Payload *pad, enum pwr_state st, bool link_up)
+/* Reboot into the bootloader's Bluetooth OTA mode. Does not return. */
+static void enter_ota(void)
+{
+	printk("OTA combo held: rebooting into the Bluetooth bootloader "
+	       "(advertises as \"AdaDFU\")\n");
+	k_msleep(20);   /* let the message out, if a console is attached */
+
+	k_timer_stop(&poll_timer);
+	esb_disable();
+	hfclk_off();
+	led_set(true);
+	nrf_gpio_cfg_default(NRF_GPIO_PIN_MAP(0, CONFIG_GC_DATA_PIN));
+
+	/* GPREGRET survives a soft reset; the bootloader reads and clears it.
+	 * (Zephyr's sys_reboot() on nRF ignores its argument, so write it
+	 * ourselves and reset directly.) */
+	NRF_POWER->GPREGRET = DFU_MAGIC_OTA_RESET;
+	NVIC_SystemReset();
+}
+
+static void print_stats(const GC_Payload *pad, enum pwr_state st, bool fast, bool link_up)
 {
 	struct ptx_stats s;
 	char line[96];
@@ -343,7 +376,7 @@ static void print_stats(const GC_Payload *pad, enum pwr_state st, bool link_up)
 
 	gc_format_payload(pad, line, sizeof(line));
 	printk("%s | rumble %u | %s | %s\n", line, current_rumble(),
-	       st == PWR_ACTIVE ? "active" : "doze",
+	       st == PWR_DOZE ? "doze" : (fast ? "active, fast poll" : "active, slow poll"),
 	       link_up ? "linked" : "SEARCHING for receiver");
 	printk("  polls ok %u bad %u | radio sent %u ok %u fail %u timeout %u retries %u"
 	       " | RTT us min %u avg %u max %u | link lost %u\n",
@@ -351,11 +384,19 @@ static void print_stats(const GC_Payload *pad, enum pwr_state st, bool link_up)
 	       s.ok ? s.rtt_min : 0, avg, s.rtt_max, s.link_lost);
 }
 
-static void set_poll_rate(enum pwr_state st)
+static void set_poll_rate(enum pwr_state st, bool fast)
 {
-	k_timeout_t period = (st == PWR_ACTIVE) ? K_USEC(CONFIG_APP_POLL_INTERVAL_US)
-						: K_MSEC(CONFIG_APP_DOZE_POLL_MS);
+	k_timeout_t period;
 
+	if (st == PWR_DOZE) {
+		period = K_MSEC(CONFIG_APP_DOZE_POLL_MS);
+	} else if (fast) {
+		period = K_USEC(CONFIG_APP_POLL_INTERVAL_US);
+	} else {
+		period = K_USEC(CONFIG_APP_POLL_SLOW_US);
+	}
+	/* Restarting also re-times the next tick from now, so switching to
+	 * fast takes effect within one fast interval. */
 	k_timer_start(&poll_timer, period, period);
 }
 
@@ -370,6 +411,7 @@ void role_run(void)
 	GC_Payload pad = {0};
 	GC_Payload last_sent = {0};
 	GC_Payload act_ref = {0};
+	GC_Payload prev = {0};
 	uint8_t seq = 0;
 
 	stats_reset();
@@ -394,9 +436,12 @@ void role_run(void)
 		int64_t next_led = now;
 		int bad_streak = 0;
 		bool link_up = true;     /* assume yes until sends start failing */
-		int fail_streak = 0;
+		int64_t last_ack = now;
 		int64_t link_lost_at = 0;
 		int64_t last_probe = 0;
+		bool fast = true;        /* adaptive poll rate (ACTIVE only) */
+		int64_t last_change = now;
+		int64_t combo_since = -1; /* OTA combo held since, or -1 */
 
 		hfclk_on();
 		pkt.type = GC_PKT_ORIGIN;
@@ -404,7 +449,8 @@ void role_run(void)
 		pkt.data = origin;
 		radio_send(&pkt);
 		act_ref = origin.state;
-		set_poll_rate(st);
+		prev = origin.state;
+		set_poll_rate(st, fast);
 
 		while (bad_streak < PAD_LOST_POLLS) {
 			k_sem_take(&tick, K_FOREVER);
@@ -423,6 +469,27 @@ void role_run(void)
 			bad_streak = 0;
 			pad = p;
 
+			/* Adaptive poll rate: a real change means someone's moving;
+			 * keep polling fast for a while after. Compared against the
+			 * state at the last real change (not the previous poll), so
+			 * sensor noise around a resting position never counts. */
+			bool input_changed = pad.byte0 != prev.byte0 ||
+					     pad.byte1 != prev.byte1 ||
+					     analog_moved(&pad, &prev, CONFIG_APP_FAST_THRESH);
+
+			if (input_changed) {
+				prev = pad;
+				last_change = now;
+				if (st == PWR_ACTIVE && !fast) {
+					fast = true;
+					set_poll_rate(st, fast);
+				}
+			} else if (st == PWR_ACTIVE && fast &&
+				   now - last_change >= CONFIG_APP_FAST_HOLD_MS) {
+				fast = false;
+				set_poll_rate(st, fast);
+			}
+
 			/* Activity: a button change, or a real stick/trigger move. */
 			if (buttons_changed(&pad, &act_ref) ||
 			    analog_moved(&pad, &act_ref, CONFIG_APP_ACTIVITY_THRESH)) {
@@ -430,8 +497,10 @@ void role_run(void)
 				last_activity = now;
 				if (st == PWR_DOZE) {
 					st = PWR_ACTIVE;
+					fast = true;
+					last_change = now;
 					hfclk_on();
-					set_poll_rate(st);
+					set_poll_rate(st, fast);
 				}
 			}
 
@@ -459,7 +528,7 @@ void role_run(void)
 				last_probe = now;
 
 				if (ok) {
-					fail_streak = 0;
+					last_ack = now;
 					if (!link_up) {
 						/* Back: resend the origin right away, in
 						 * case the receiver was restarted. */
@@ -470,7 +539,7 @@ void role_run(void)
 						last_origin_ms = 0;
 					}
 				} else if (link_up &&
-					   ++fail_streak >= CONFIG_APP_LINK_LOSS_FAILS) {
+					   now - last_ack >= CONFIG_APP_LINK_LOSS_MS) {
 					link_up = false;
 					link_lost_at = now;
 					stats.link_lost++;
@@ -490,9 +559,35 @@ void role_run(void)
 				hfclk_off();
 			}
 
+			/* OTA combo: L + R + Z + A held continuously. */
+			bool ota_feedback = false;
+
+			if (IS_ENABLED(CONFIG_APP_OTA_COMBO) &&
+			    (pad.byte0 & OTA_BYTE0_MASK) == OTA_BYTE0_MASK &&
+			    (pad.byte1 & OTA_BYTE1_MASK) == OTA_BYTE1_MASK) {
+				if (combo_since < 0) {
+					combo_since = now;
+				}
+				int64_t held = now - combo_since;
+
+#if defined(CONFIG_APP_OTA_HOLD_MS)
+				if (held >= CONFIG_APP_OTA_HOLD_MS) {
+					enter_ota();
+				}
+#endif
+				if (held >= OTA_FEEDBACK_MS) {
+					/* Flicker (~5 Hz) so you know it's counting. */
+					led_set(((now / 100) & 1) != 0);
+					ota_feedback = true;
+				}
+			} else if (combo_since >= 0) {
+				combo_since = -1;
+				led_set(false);
+			}
+
 			/* Status LED (off while dozing): short pulse every 2 s while
 			 * linked, longer blink every 1 s while searching. */
-			if (IS_ENABLED(CONFIG_APP_STATUS_LED) && st == PWR_ACTIVE) {
+			if (IS_ENABLED(CONFIG_APP_STATUS_LED) && st == PWR_ACTIVE && !ota_feedback) {
 				int64_t period = link_up ? LED_PERIOD_MS : LED_SEARCH_PERIOD_MS;
 				int64_t pulse = link_up ? LED_PULSE_MS : LED_SEARCH_PULSE_MS;
 
@@ -520,12 +615,12 @@ void role_run(void)
 				st = PWR_DOZE;
 				led_set(false);
 				hfclk_off();
-				set_poll_rate(st);
+				set_poll_rate(st, fast);
 			}
 
 			if (now >= next_print) {
 				next_print += 1000;
-				print_stats(&pad, st, link_up);
+				print_stats(&pad, st, fast, link_up);
 			}
 		}
 
