@@ -29,6 +29,8 @@ struct prx_stats {
 	uint32_t dups;       /* duplicate / out-of-order packets, ignored */
 	int32_t rssi_sum;    /* ESB reports RSSI as a positive number, -dBm */
 	uint32_t ack_queue_full;
+	uint32_t stale;      /* times the input went neutral (no packets for STALE_MS) */
+	uint32_t max_gap_ms; /* longest time between accepted packets */
 };
 
 static struct prx_stats stats;
@@ -42,6 +44,7 @@ static struct gc_seq s_seq;
 /* Latest state from the controller board. Written in the ESB ISR. */
 static GC_Payload s_input;
 static int64_t s_input_ms = -INPUT_STALE_MS;
+static int64_t s_last_rx_ms = -1;   /* last accepted packet, any type */
 static GC_Origin s_origin = {
 	.state = {
 		.byte1 = GC_BYTE1_ALWAYS_ONE,
@@ -133,6 +136,13 @@ void app_esb_handler(const struct esb_evt *event)
 		}
 		stats.missed += missed;
 
+		int64_t t = k_uptime_get();
+
+		if (s_last_rx_ms >= 0 && t - s_last_rx_ms > stats.max_gap_ms) {
+			stats.max_gap_ms = (uint32_t)(t - s_last_rx_ms);
+		}
+		s_last_rx_ms = t;
+
 		if (pkt.type == GC_PKT_INPUT) {
 			s_input = pkt.data.state;
 			s_input_ms = k_uptime_get();
@@ -186,6 +196,7 @@ static void stale_fn(struct k_timer *t)
 		GC_Payload n = neutral_input();
 
 		s_stale = true;
+		stats.stale++;
 		joybus_target_set_state(&n, &s_origin);
 	}
 	irq_unlock(key);
@@ -216,8 +227,9 @@ static void print_stats(void)
 	gc_format_payload(&in, line, sizeof(line));
 	printk("%s | %s | rumble %u\n", line, fresh ? "live" : "STALE->neutral",
 	       joybus_target_rumble());
-	printk("  radio rx %u (input %u origin %u) missed %u dup %u rssi -%d dBm | origin %s\n",
-	       s.rx, s.inputs, s.origins, s.missed, s.dups,
+	printk("  radio rx %u (input %u origin %u) missed %u dup %u gap %u ms stale %u"
+	       " rssi -%d dBm | origin %s\n",
+	       s.rx, s.inputs, s.origins, s.missed, s.dups, s.max_gap_ms, s.stale,
 	       s.rx ? (int)(s.rssi_sum / (int32_t)s.rx) : 0,
 	       have_org ? "ok" : "not yet");
 	printk("  console polls %u origin %u id %u | errors %u unknown %u late %u\n",

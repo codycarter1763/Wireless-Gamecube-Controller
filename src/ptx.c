@@ -235,6 +235,9 @@ static bool radio_send(const GC_TxPacket *pkt)
 	memcpy(tx.data, pkt, sizeof(*pkt));
 
 	last_ok = false;
+	/* Clear any completion left over from a send that timed out, so it
+	 * can't be mistaken for this packet's result. */
+	k_sem_reset(&tx_done);
 	dbg_pin_set(true);
 	t_start = us_now();
 	int err = esb_write_payload(&tx);
@@ -248,6 +251,10 @@ static bool radio_send(const GC_TxPacket *pkt)
 	if (k_sem_take(&tx_done, K_MSEC(10)) != 0) {
 		stats.timeouts++;
 		esb_flush_tx();
+		/* The flush can fail if the radio is still busy; make sure the
+		 * next send flushes before queueing, so this stale packet can't
+		 * go out after a newer one. */
+		last_failed = true;
 		return false;
 	}
 	return last_ok;
@@ -476,8 +483,17 @@ void role_run(void)
 
 				bool ok = radio_send(&pkt);
 
-				last_sent = pad;
-				last_send = now;
+				/* Only an acknowledged packet counts as delivered. If it
+				 * failed, leave last_sent and last_send alone: the input
+				 * still differs / the keepalive is still due, so the next
+				 * poll sends again right away. Waiting a full keepalive
+				 * period after each failure let a run of lost keepalives
+				 * reach the receiver's stale timeout while a stick or
+				 * button was held, briefly centering it. */
+				if (ok) {
+					last_sent = pad;
+					last_send = now;
+				}
 
 				switch (gc_link_on_send(&link, now, ok, CONFIG_APP_LINK_LOSS_MS)) {
 				case GC_LINK_RESTORED:
